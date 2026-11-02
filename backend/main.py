@@ -1,4 +1,7 @@
 import os
+import re
+import sqlite3
+import sys
 import time
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,10 +9,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
-import pymysql
 import uvicorn
 import uuid
 from typing import Optional, List, Union
+
+for output_stream in (sys.stdout, sys.stderr):
+    if hasattr(output_stream, "reconfigure"):
+        output_stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 app = FastAPI()
 
@@ -42,23 +48,136 @@ async def validation_exception_handler(request, exc):
     )
 
 # --- CẤU HÌNH LƯU TRỮ FILE TĨNH ---
-UPLOAD_DIR = "uploads"
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BACKEND_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Cấu hình mở cổng truy cập các file tĩnh (bao gồm ảnh bìa sách, pdf, mp3, avatar, và ảnh bài đăng...)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
-DB_CONFIG = {
-    "host": "localhost",
-    "user": "root",
-    "password": "",
-    "database": "ebook_app",
-    "autocommit": True
-}
+DB_PATH = os.path.join(BACKEND_DIR, "ebook_app.sqlite3")
 
 def get_connection():
-    return pymysql.connect(**DB_CONFIG, cursorclass=pymysql.cursors.DictCursor)
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    conn.row_factory = lambda cursor, row: {
+        column[0]: row[index] for index, column in enumerate(cursor.description)
+    }
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+def ensure_column(cursor, table: str, column: str, definition: str):
+    columns = {row["name"] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+def format_timestamp(value):
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
+
+def seed_upload_books():
+    files = sorted(
+        filename for filename in os.listdir(UPLOAD_DIR)
+        if os.path.isfile(os.path.join(UPLOAD_DIR, filename))
+    )
+    pdf_files = [filename for filename in files if os.path.splitext(filename)[1].lower() == ".pdf"]
+    audio_files = [filename for filename in files if os.path.splitext(filename)[1].lower() == ".mp3"]
+    image_files = [
+        filename for filename in files
+        if os.path.splitext(filename)[1].lower() in {".jpg", ".jpeg", ".png"}
+        and not filename.startswith(("avatar_", "shop_book_", "JPEG_"))
+    ]
+
+    def file_timestamp(filename):
+        match = re.search(r"\d{13}", filename)
+        return int(match.group()) if match else None
+
+    def pair_files(source_files, target_files):
+        candidates = []
+        for source in source_files:
+            source_time = file_timestamp(source)
+            for target in target_files:
+                target_time = file_timestamp(target)
+                if source_time is not None and target_time is not None:
+                    distance = abs(source_time - target_time)
+                    if distance <= 15000:
+                        candidates.append((distance, source, target))
+
+        pairs = {}
+        used_sources = set()
+        used_targets = set()
+        for _, source, target in sorted(candidates):
+            if source not in used_sources and target not in used_targets:
+                pairs[source] = target
+                used_sources.add(source)
+                used_targets.add(target)
+        return pairs, used_targets
+
+    audio_pairs, paired_audio_files = pair_files(pdf_files, audio_files)
+    image_pairs, _ = pair_files(pdf_files, image_files)
+    base_url = "http://10.0.2.2:8000/uploads/"
+    conn = get_connection()
+    try:
+        existing_urls = {
+            url
+            for row in conn.execute("SELECT pdf_url, audio_url FROM books").fetchall()
+            for url in row.values()
+            if url
+        }
+        book_number = 0
+
+        for pdf_filename in pdf_files:
+            pdf_url = base_url + pdf_filename
+            audio_filename = audio_pairs.get(pdf_filename)
+            audio_url = base_url + audio_filename if audio_filename else ""
+            if pdf_url in existing_urls or (audio_url and audio_url in existing_urls):
+                continue
+
+            book_number += 1
+            image_filename = image_pairs.get(pdf_filename)
+            image_url = base_url + image_filename if image_filename else ""
+            conn.execute(
+                """
+                INSERT INTO books (title, author, image_url, pdf_url, audio_url)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    f"Sách tải lên {book_number:02d}",
+                    "Thư viện",
+                    image_url,
+                    pdf_url,
+                    audio_url,
+                ),
+            )
+            existing_urls.add(pdf_url)
+            if audio_url:
+                existing_urls.add(audio_url)
+
+        for audio_filename in audio_files:
+            if audio_filename in paired_audio_files:
+                continue
+            audio_url = base_url + audio_filename
+            if audio_url in existing_urls:
+                continue
+
+            book_number += 1
+            conn.execute(
+                """
+                INSERT INTO books (title, author, image_url, pdf_url, audio_url)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    f"Audiobook tải lên {book_number:02d}",
+                    "Thư viện",
+                    "",
+                    "",
+                    audio_url,
+                ),
+            )
+            existing_urls.add(audio_url)
+    finally:
+        conn.close()
 
 # --- MODEL DATA (PYDANTIC) ---
 class UserAuth(BaseModel):
@@ -126,7 +245,7 @@ def init_db():
     # Bảng books (Chứa thông tin sách đọc/nghe và các link file tĩnh cục bộ)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS books (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             title VARCHAR(255) NOT NULL,
             author VARCHAR(255),
             content TEXT,
@@ -139,7 +258,7 @@ def init_db():
     # BẢNG: shop_books (Chứa thông tin của Kệ Sách Bán độc lập)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS shop_books (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             title VARCHAR(255) NOT NULL,
             author VARCHAR(255) NOT NULL,
             price DECIMAL(10, 2) NOT NULL,
@@ -148,25 +267,20 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    ensure_column(cursor, "shop_books", "library_book_id", "INTEGER")
+    ensure_column(cursor, "shop_books", "is_active", "INTEGER NOT NULL DEFAULT 1")
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_shop_books_library_book_id "
+        "ON shop_books(library_book_id)"
+    )
     print(">>> [Hệ thống] Khởi tạo bảng shop_books thành công!")
 
-    # Tự động nâng cấp bảng books nếu chưa có pdf_url
-    try:
-        cursor.execute("""
-            SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = 'ebook_app' AND TABLE_NAME = 'books' AND COLUMN_NAME = 'pdf_url'
-        """)
-        if not cursor.fetchone():
-            cursor.execute("ALTER TABLE books ADD COLUMN pdf_url VARCHAR(500) AFTER image_url")
-            print(">>> [Hệ thống] Đã tự động nâng cấp bảng books: Thêm cột 'pdf_url'!")
-    except Exception as db_err:
-        print(f">>> Lỗi nâng cấp bảng books: {db_err}")
-
+    ensure_column(cursor, "books", "pdf_url", "VARCHAR(500)")
 
     # Bảng users
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             username VARCHAR(100) UNIQUE NOT NULL,
             password VARCHAR(100) NOT NULL,
             is_admin BOOLEAN DEFAULT FALSE,
@@ -175,52 +289,24 @@ def init_db():
         )
     ''')
 
-    # TỰ ĐỘNG NÂNG CẤP BẢNG users: THÊM full_name & avatar_url NẾU CHƯA CÓ
-    try:
-        cursor.execute("""
-            SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = 'ebook_app' AND TABLE_NAME = 'users' AND COLUMN_NAME = 'full_name'
-        """)
-        if not cursor.fetchone():
-            cursor.execute("ALTER TABLE users ADD COLUMN full_name VARCHAR(255) AFTER is_admin")
-            print(">>> [Hệ thống] Đã tự động nâng cấp bảng users: Thêm cột 'full_name'!")
-
-        cursor.execute("""
-            SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = 'ebook_app' AND TABLE_NAME = 'users' AND COLUMN_NAME = 'avatar_url'
-        """)
-        if not cursor.fetchone():
-            cursor.execute("ALTER TABLE users ADD COLUMN avatar_url VARCHAR(500) AFTER full_name")
-            print(">>> [Hệ thống] Đã tự động nâng cấp bảng users: Thêm cột 'avatar_url'!")
-    except Exception as db_err:
-        print(f">>> Lỗi nâng cấp bảng users: {db_err}")
-
+    ensure_column(cursor, "users", "full_name", "VARCHAR(255)")
+    ensure_column(cursor, "users", "avatar_url", "VARCHAR(500)")
 
     # --- BẢNG LƯU TRỮ BOOKMARK ---
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS bookmarks (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             username VARCHAR(100) NOT NULL,
             book_id INT NOT NULL,
             page_number INT NOT NULL,
             note TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE KEY unique_user_book_page (username, book_id, page_number),
+            UNIQUE (username, book_id, page_number),
             FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
         )
     ''')
 
-    # TỰ ĐỘNG NÂNG CẤP BẢNG bookmarks: Thêm cột 'note' nếu chưa có
-    try:
-        cursor.execute("""
-            SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = 'ebook_app' AND TABLE_NAME = 'bookmarks' AND COLUMN_NAME = 'note'
-        """)
-        if not cursor.fetchone():
-            cursor.execute("ALTER TABLE bookmarks ADD COLUMN note TEXT AFTER page_number")
-            print(">>> [Hệ thống] Đã tự động nâng cấp bảng bookmarks: Thêm cột 'note' thành công!")
-    except Exception as db_err:
-        print(f">>> Lỗi nâng cấp bảng bookmarks: {db_err}")
+    ensure_column(cursor, "bookmarks", "note", "TEXT")
 
     print(">>> [Hệ thống] Khởi tạo bảng bookmarks thành công!")
 
@@ -232,7 +318,7 @@ def init_db():
     # 1. Bảng posts (Có bổ sung trường status cho cơ chế kiểm duyệt)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS posts (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             username VARCHAR(100) NOT NULL,
             content TEXT NOT NULL,
             image_url VARCHAR(500),
@@ -241,25 +327,15 @@ def init_db():
         )
     ''')
 
-    # TỰ ĐỘNG NÂNG CẤP BẢNG posts: Thêm cột 'status' nếu bảng đã có sẵn từ trước
-    try:
-        cursor.execute("""
-            SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = 'ebook_app' AND TABLE_NAME = 'posts' AND COLUMN_NAME = 'status'
-        """)
-        if not cursor.fetchone():
-            cursor.execute("ALTER TABLE posts ADD COLUMN status VARCHAR(50) DEFAULT 'pending' AFTER image_url")
-            print(">>> [Hệ thống] Đã tự động nâng cấp bảng posts: Thêm cột kiểm duyệt 'status'!")
-    except Exception as db_err:
-        print(f">>> Lỗi nâng cấp bảng posts: {db_err}")
+    ensure_column(cursor, "posts", "status", "VARCHAR(50) DEFAULT 'pending'")
 
     # 2. Bảng likes (Lượt thích bài viết)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS likes (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             post_id INT NOT NULL,
             username VARCHAR(100) NOT NULL,
-            UNIQUE KEY unique_user_post_like (username, post_id),
+            UNIQUE (username, post_id),
             FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE
         )
     ''')
@@ -267,7 +343,7 @@ def init_db():
     # 3. Bảng comments (Bình luận bài viết)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS comments (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             post_id INT NOT NULL,
             username VARCHAR(100) NOT NULL,
             content TEXT NOT NULL,
@@ -279,7 +355,7 @@ def init_db():
     # --- [BỔ SUNG BẢNG MỚI] QUẢN LÝ ĐƠN HÀNG (ORDERS & ORDER_ITEMS) ---
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS orders (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             username VARCHAR(100) NOT NULL,
             full_name VARCHAR(255) NOT NULL,
             phone VARCHAR(50) NOT NULL,
@@ -292,7 +368,7 @@ def init_db():
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS order_items (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             order_id INT NOT NULL,
             book_id INT NOT NULL,
             quantity INT NOT NULL,
@@ -309,7 +385,7 @@ def init_db():
     admin_exist = cursor.fetchone()
     if not admin_exist:
         cursor.execute(
-            "INSERT INTO users (username, password, is_admin, full_name) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO users (username, password, is_admin, full_name) VALUES (?, ?, ?, ?)",
             ("admin", "123", True, "Quản trị viên")
         )
         print(">>> Đã khởi tạo tài khoản admin mặc định thành công!")
@@ -319,6 +395,7 @@ def init_db():
 
 # Chạy khởi tạo Database tự động khi khởi động server
 init_db()
+seed_upload_books()
 
 
 # --- 2. CÁC API HỆ THỐNG ---
@@ -330,7 +407,7 @@ def register(user: UserAuth):
     cursor = conn.cursor()
     try:
         cursor.execute(
-            "INSERT INTO users (username, password, is_admin, full_name) VALUES (%s, %s, FALSE, %s)",
+            "INSERT INTO users (username, password, is_admin, full_name) VALUES (?, ?, FALSE, ?)",
             (user.username, user.password, user.username)
         )
         return {"status": "success", "message": "Đăng ký thành công!"}
@@ -345,7 +422,7 @@ def login(user: UserAuth):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, username, is_admin, full_name, avatar_url FROM users WHERE username = %s AND password = %s",
+        "SELECT id, username, is_admin, full_name, avatar_url FROM users WHERE username = ? AND password = ?",
         (user.username, user.password)
     )
     row = cursor.fetchone()
@@ -376,7 +453,7 @@ async def update_profile(
     cursor = conn.cursor()
 
     try:
-        cursor.execute("SELECT id, avatar_url FROM users WHERE username = %s", (username,))
+        cursor.execute("SELECT id, avatar_url FROM users WHERE username = ?", (username,))
         user = cursor.fetchone()
 
         if not user:
@@ -404,7 +481,7 @@ async def update_profile(
                     print(f">>> Cảnh báo lỗi xóa avatar cũ: {file_err}")
 
         cursor.execute(
-            "UPDATE users SET full_name = %s, avatar_url = %s WHERE username = %s",
+            "UPDATE users SET full_name = ?, avatar_url = ? WHERE username = ?",
             (full_name, new_avatar_url, username)
         )
         conn.close()
@@ -447,7 +524,7 @@ async def add_book(
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT is_admin FROM users WHERE username = %s", (username,))
+    cursor.execute("SELECT is_admin FROM users WHERE username = ?", (username,))
     admin = cursor.fetchone()
 
     if not admin or not admin['is_admin']:
@@ -471,7 +548,7 @@ async def add_book(
 
         sql = """
             INSERT INTO books (title, author, image_url, pdf_url, audio_url)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (?, ?, ?, ?, ?)
         """
         cursor.execute(sql, (title, author, image_url, pdf_url, audio_url))
         conn.close()
@@ -491,7 +568,7 @@ def delete_book(book_id: int):
     cursor = conn.cursor()
 
     try:
-        cursor.execute("SELECT image_url, pdf_url, audio_url FROM books WHERE id = %s", (book_id,))
+        cursor.execute("SELECT image_url, pdf_url, audio_url FROM books WHERE id = ?", (book_id,))
         book = cursor.fetchone()
 
         if not book:
@@ -513,7 +590,7 @@ def delete_book(book_id: int):
         delete_physical_file(book.get('pdf_url', ''))
         delete_physical_file(book.get('audio_url', ''))
 
-        cursor.execute("DELETE FROM books WHERE id = %s", (book_id,))
+        cursor.execute("DELETE FROM books WHERE id = ?", (book_id,))
         conn.close()
         return {"status": "success", "message": "Đã xóa sách thành công!"}
 
@@ -533,13 +610,50 @@ def get_shop_books():
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT * FROM shop_books ORDER BY id DESC")
+        cursor.execute("SELECT * FROM shop_books WHERE is_active = 1 ORDER BY id DESC")
         books = cursor.fetchall()
         for book in books:
             book['price'] = float(book['price'])
         return books
     except Exception as e:
         print(">>> LỖI LẤY KỆ SÁCH BÁN:", str(e))
+        raise HTTPException(status_code=500, detail=f"Lỗi hệ thống: {str(e)}")
+    finally:
+        conn.close()
+
+# A.1. ĐỒNG BỘ SÁCH ĐỌC/NGHE SANG GIAN HÀNG BÁN
+@app.post("/api/shop-books/sync-library")
+def sync_library_books_to_shop():
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        library_columns = {
+            row["name"] for row in cursor.execute("PRAGMA table_info(books)").fetchall()
+        }
+        price_expression = (
+            "COALESCE(NULLIF(price, 0), 50000)"
+            if "price" in library_columns
+            else "50000"
+        )
+        cursor.execute(
+            f"""
+            INSERT OR IGNORE INTO shop_books
+                (title, author, price, image_path, description, library_book_id)
+            SELECT title, COALESCE(author, ''), {price_expression},
+                   image_url, COALESCE(content, ''), id
+            FROM books
+            """
+        )
+        synced_count = cursor.rowcount
+        library_count = cursor.execute("SELECT COUNT(*) AS count FROM books").fetchone()["count"]
+        return {
+            "status": "success",
+            "synced_count": synced_count,
+            "library_count": library_count,
+            "default_price": 50000,
+        }
+    except Exception as e:
+        print(">>> LỖI ĐỒNG BỘ SÁCH THƯ VIỆN SANG GIAN HÀNG:", str(e))
         raise HTTPException(status_code=500, detail=f"Lỗi hệ thống: {str(e)}")
     finally:
         conn.close()
@@ -567,7 +681,7 @@ async def add_shop_book(
 
         sql = """
             INSERT INTO shop_books (title, author, price, image_path, description)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (?, ?, ?, ?, ?)
         """
         cursor.execute(sql, (title.strip(), author.strip(), price, image_url, description.strip()))
         conn.close()
@@ -585,12 +699,20 @@ def delete_shop_book(book_id: int):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT image_path FROM shop_books WHERE id = %s", (book_id,))
+        cursor.execute(
+            "SELECT image_path, library_book_id FROM shop_books WHERE id = ?",
+            (book_id,)
+        )
         book = cursor.fetchone()
 
         if not book:
             conn.close()
             raise HTTPException(status_code=404, detail="Không tìm thấy sách bán để xóa!")
+
+        if book.get("library_book_id") is not None:
+            cursor.execute("UPDATE shop_books SET is_active = 0 WHERE id = ?", (book_id,))
+            conn.close()
+            return {"status": "success", "message": "Đã gỡ sách khỏi kệ bán thành công!"}
 
         image_path = book.get('image_path')
         if image_path:
@@ -602,7 +724,7 @@ def delete_shop_book(book_id: int):
             except Exception as file_err:
                 print(f">>> Lỗi dọn dẹp file ảnh bìa sách bán cũ: {file_err}")
 
-        cursor.execute("DELETE FROM shop_books WHERE id = %s", (book_id,))
+        cursor.execute("DELETE FROM shop_books WHERE id = ?", (book_id,))
         conn.close()
         return {"status": "success", "message": "Đã xóa sách khỏi kệ bán thành công!"}
     except HTTPException as he:
@@ -627,7 +749,7 @@ def checkout_order(data: CheckoutInput):
         # Lưu thông tin đơn hàng tổng quát
         order_sql = """
             INSERT INTO orders (username, full_name, phone, address, total_amount, status)
-            VALUES (%s, %s, %s, %s, %s, 'pending')
+            VALUES (?, ?, ?, ?, ?, 'pending')
         """
         cursor.execute(order_sql, (data.username, data.full_name, data.phone, data.address, data.total_amount))
         order_id = cursor.lastrowid
@@ -636,7 +758,7 @@ def checkout_order(data: CheckoutInput):
         for item in data.items:
             item_sql = """
                 INSERT INTO order_items (order_id, book_id, quantity, price)
-                VALUES (%s, %s, %s, %s)
+                VALUES (?, ?, ?, ?)
             """
             cursor.execute(item_sql, (order_id, item.book_id, item.quantity, item.price))
 
@@ -658,7 +780,7 @@ def get_user_order_history(username: str):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT * FROM orders WHERE username = %s ORDER BY id DESC", (username,))
+        cursor.execute("SELECT * FROM orders WHERE username = ? ORDER BY id DESC", (username,))
         orders = cursor.fetchall()
 
         for order in orders:
@@ -669,7 +791,7 @@ def get_user_order_history(username: str):
                 SELECT oi.*, sb.title, sb.image_path, sb.author
                 FROM order_items oi
                 JOIN shop_books sb ON oi.book_id = sb.id
-                WHERE oi.order_id = %s
+                WHERE oi.order_id = ?
             """
             cursor.execute(items_sql, (order['id'],))
             items = cursor.fetchall()
@@ -705,7 +827,7 @@ def get_all_orders_for_admin(current_user: str):
                 SELECT oi.*, sb.title, sb.image_path, sb.author
                 FROM order_items oi
                 JOIN shop_books sb ON oi.book_id = sb.id
-                WHERE oi.order_id = %s
+                WHERE oi.order_id = ?
             """
             cursor.execute(items_sql, (order['id'],))
             items = cursor.fetchall()
@@ -731,7 +853,7 @@ def update_order_status(data: UpdateOrderStatusInput, current_user: str):
     cursor = conn.cursor()
     try:
         cursor.execute(
-            "UPDATE orders SET status = %s WHERE id = %s",
+            "UPDATE orders SET status = ? WHERE id = ?",
             (data.status, data.order_id)
         )
         return {"status": "success", "message": f"Cập nhật trạng thái đơn sang '{data.status}' thành công!"}
@@ -766,7 +888,7 @@ def delete_user(user_id: int):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT username, is_admin FROM users WHERE id = %s", (user_id,))
+        cursor.execute("SELECT username, is_admin FROM users WHERE id = ?", (user_id,))
         user = cursor.fetchone()
 
         if not user:
@@ -775,7 +897,7 @@ def delete_user(user_id: int):
         if user['username'] == 'admin':
             raise HTTPException(status_code=400, detail="Không thể xóa tài khoản Admin mặc định!")
 
-        cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+        cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
         return {"status": "success", "message": f"Đã xóa tài khoản '{user['username']}' thành công!"}
     except HTTPException as he:
         raise he
@@ -798,7 +920,7 @@ def toggle_bookmark(data: BookmarkInput):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT id FROM users WHERE username = %s", (user_raw,))
+        cursor.execute("SELECT id FROM users WHERE username = ?", (user_raw,))
         db_user = cursor.fetchone()
         if not db_user:
             raise HTTPException(
@@ -807,17 +929,17 @@ def toggle_bookmark(data: BookmarkInput):
             )
 
         cursor.execute(
-            "SELECT id FROM bookmarks WHERE username = %s AND book_id = %s AND page_number = %s",
+            "SELECT id FROM bookmarks WHERE username = ? AND book_id = ? AND page_number = ?",
             (user_raw, data.book_id, data.page_number)
         )
         existing = cursor.fetchone()
 
         if existing:
-            cursor.execute("DELETE FROM bookmarks WHERE id = %s", (existing['id'],))
+            cursor.execute("DELETE FROM bookmarks WHERE id = ?", (existing['id'],))
             return {"status": "removed", "message": f"Đã hủy đánh dấu trang {data.page_number}"}
         else:
             cursor.execute(
-                "INSERT INTO bookmarks (username, book_id, page_number, note) VALUES (%s, %s, %s, %s)",
+                "INSERT INTO bookmarks (username, book_id, page_number, note) VALUES (?, ?, ?, ?)",
                 (user_raw, data.book_id, data.page_number, data.note)
             )
             return {"status": "added", "message": f"Đã đánh dấu trang {data.page_number} thành công!"}
@@ -843,7 +965,7 @@ def get_user_bookmarks(username: str):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT id FROM users WHERE username = %s", (user_raw,))
+        cursor.execute("SELECT id FROM users WHERE username = ?", (user_raw,))
         db_user = cursor.fetchone()
         if not db_user:
             raise HTTPException(
@@ -856,7 +978,7 @@ def get_user_bookmarks(username: str):
                    s.title as book_title, s.author as book_author, s.image_url, s.pdf_url
             FROM bookmarks b
             JOIN books s ON b.book_id = s.id
-            WHERE b.username = %s
+            WHERE b.username = ?
             ORDER BY b.created_at DESC
         """
         cursor.execute(sql, (user_raw,))
@@ -898,7 +1020,7 @@ async def create_feed_post(
             image_url = f"http://10.0.2.2:8000/uploads/{unique_filename}"
 
         cursor.execute(
-            "INSERT INTO posts (username, content, image_url, status) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO posts (username, content, image_url, status) VALUES (?, ?, ?, ?)",
             (username.strip(), content.strip(), image_url if image_url else None, initial_status)
         )
         conn.close()
@@ -924,17 +1046,17 @@ def get_feed_posts(current_user: str):
         for post in posts:
             post_id = post['id']
 
-            cursor.execute("SELECT COUNT(*) as cnt FROM likes WHERE post_id = %s", (post_id,))
+            cursor.execute("SELECT COUNT(*) as cnt FROM likes WHERE post_id = ?", (post_id,))
             likes_count = cursor.fetchone()['cnt']
 
             cursor.execute(
-                "SELECT id FROM likes WHERE post_id = %s AND username = %s",
+                "SELECT id FROM likes WHERE post_id = ? AND username = ?",
                 (post_id, current_user.strip())
             )
             is_liked = cursor.fetchone() is not None
 
             cursor.execute(
-                "SELECT id, username, content, created_at FROM comments WHERE post_id = %s ORDER BY created_at ASC",
+                "SELECT id, username, content, created_at FROM comments WHERE post_id = ? ORDER BY created_at ASC",
                 (post_id,)
             )
             comments = cursor.fetchall()
@@ -945,7 +1067,7 @@ def get_feed_posts(current_user: str):
                     "id": comment['id'],
                     "username": comment['username'],
                     "content": comment['content'],
-                    "created_at": comment['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                    "created_at": format_timestamp(comment['created_at'])
                 })
 
             result.append({
@@ -954,7 +1076,7 @@ def get_feed_posts(current_user: str):
                 "content": post['content'],
                 "image_url": post['image_url'],
                 "status": post['status'],
-                "created_at": post['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at": format_timestamp(post['created_at']),
                 "likes_count": likes_count,
                 "is_liked": is_liked,
                 "comments": formatted_comments
@@ -983,19 +1105,19 @@ def get_pending_posts(current_user: str):
         for post in posts:
             post_id = post['id']
 
-            cursor.execute("SELECT COUNT(*) as cnt FROM likes WHERE post_id = %s", (post_id,))
+            cursor.execute("SELECT COUNT(*) as cnt FROM likes WHERE post_id = ?", (post_id,))
             likes_count = cursor.fetchone()['cnt']
 
-            cursor.execute("SELECT id FROM likes WHERE post_id = %s AND username = %s", (post_id, current_user.strip()))
+            cursor.execute("SELECT id FROM likes WHERE post_id = ? AND username = ?", (post_id, current_user.strip()))
             is_liked = cursor.fetchone() is not None
 
-            cursor.execute("SELECT id, username, content, created_at FROM comments WHERE post_id = %s ORDER BY created_at ASC", (post_id,))
+            cursor.execute("SELECT id, username, content, created_at FROM comments WHERE post_id = ? ORDER BY created_at ASC", (post_id,))
             comments = cursor.fetchall()
             formatted_comments = [{
                 "id": c['id'],
                 "username": c['username'],
                 "content": c['content'],
-                "created_at": c['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                "created_at": format_timestamp(c['created_at'])
             } for c in comments]
 
             result.append({
@@ -1004,7 +1126,7 @@ def get_pending_posts(current_user: str):
                 "content": post['content'],
                 "image_url": post['image_url'],
                 "status": post['status'],
-                "created_at": post['created_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at": format_timestamp(post['created_at']),
                 "likes_count": likes_count,
                 "is_liked": is_liked,
                 "comments": formatted_comments
@@ -1026,12 +1148,12 @@ def approve_feed_post(post_id: int, username: str):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT id FROM posts WHERE id = %s", (post_id,))
+        cursor.execute("SELECT id FROM posts WHERE id = ?", (post_id,))
         post = cursor.fetchone()
         if not post:
             raise HTTPException(status_code=404, detail="Không tìm thấy bài viết yêu cầu duyệt!")
 
-        cursor.execute("UPDATE posts SET status = 'approved' WHERE id = %s", (post_id,))
+        cursor.execute("UPDATE posts SET status = 'approved' WHERE id = ?", (post_id,))
         conn.close()
         return {"status": "success", "message": "Bài viết đã được duyệt công khai!"}
     except Exception as e:
@@ -1048,7 +1170,7 @@ def delete_feed_post(post_id: int, username: str):
     user_strip = username.strip()
 
     try:
-        cursor.execute("SELECT username, image_url FROM posts WHERE id = %s", (post_id,))
+        cursor.execute("SELECT username, image_url FROM posts WHERE id = ?", (post_id,))
         post = cursor.fetchone()
         if not post:
             conn.close()
@@ -1068,7 +1190,7 @@ def delete_feed_post(post_id: int, username: str):
             except Exception as file_err:
                 print(f">>> Lỗi dọn dẹp ảnh bài đăng: {file_err}")
 
-        cursor.execute("DELETE FROM posts WHERE id = %s", (post_id,))
+        cursor.execute("DELETE FROM posts WHERE id = ?", (post_id,))
         conn.close()
         return {"status": "success", "message": "Đã xóa bài đăng thành công!"}
     except HTTPException as he:
@@ -1088,18 +1210,18 @@ def toggle_feed_like(post_id: int, username: str):
 
     try:
         cursor.execute(
-            "SELECT id FROM likes WHERE post_id = %s AND username = %s",
+            "SELECT id FROM likes WHERE post_id = ? AND username = ?",
             (post_id, user_strip)
         )
         like_record = cursor.fetchone()
 
         if like_record:
-            cursor.execute("DELETE FROM likes WHERE id = %s", (like_record['id'],))
+            cursor.execute("DELETE FROM likes WHERE id = ?", (like_record['id'],))
             conn.close()
             return {"status": "unliked", "message": "Đã bỏ thích bài viết thành công!"}
         else:
             cursor.execute(
-                "INSERT INTO likes (post_id, username) VALUES (%s, %s)",
+                "INSERT INTO likes (post_id, username) VALUES (?, ?)",
                 (post_id, user_strip)
             )
             conn.close()
@@ -1122,13 +1244,13 @@ def add_feed_comment(post_id: int, username: str, content: str = Form(...)):
 
     try:
         cursor.execute(
-            "INSERT INTO comments (post_id, username, content) VALUES (%s, %s, %s)",
+            "INSERT INTO comments (post_id, username, content) VALUES (?, ?, ?)",
             (post_id, user_strip, content.strip())
         )
 
         last_id = cursor.lastrowid
         cursor.execute(
-            "SELECT id, username, content, created_at FROM comments WHERE id = %s",
+            "SELECT id, username, content, created_at FROM comments WHERE id = ?",
             (last_id,)
         )
         new_comment = cursor.fetchone()
@@ -1138,7 +1260,7 @@ def add_feed_comment(post_id: int, username: str, content: str = Form(...)):
             "id": new_comment['id'],
             "username": new_comment['username'],
             "content": new_comment['content'],
-            "created_at": new_comment['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+            "created_at": format_timestamp(new_comment['created_at'])
         }
     except Exception as e:
         if conn:

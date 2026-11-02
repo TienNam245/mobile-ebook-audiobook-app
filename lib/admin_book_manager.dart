@@ -27,18 +27,41 @@ class _AdminBookManagerState extends State<AdminBookManager> {
   Future<void> _fetchBooks() async {
     if (!mounted) return;
     setState(() => _isLoading = true);
-    final url = Uri.parse('http://10.0.2.2:8000/api/shop-books');
+    String? syncError;
     try {
-      final response = await http.get(url);
-      if (response.statusCode == 200) {
-        if (mounted) {
-          setState(() {
-            _books = jsonDecode(utf8.decode(response.bodyBytes));
-          });
-        }
+      final syncUrl = Uri.parse('http://10.0.2.2:8000/api/shop-books/sync-library');
+      final syncResponse = await http.post(syncUrl);
+      if (syncResponse.statusCode != 200) {
+        syncError = "Đồng bộ sách thư viện thất bại (${syncResponse.statusCode}).";
       }
     } catch (e) {
-      _showSnackBar("Lỗi kết nối server lấy danh sách!", Colors.red);
+      syncError = "Không thể đồng bộ sách thư viện: $e";
+    }
+
+    try {
+      final url = Uri.parse('http://10.0.2.2:8000/api/shop-books');
+      final response = await http.get(url);
+      if (response.statusCode == 200) {
+        final decodedBooks = jsonDecode(utf8.decode(response.bodyBytes));
+        if (decodedBooks is! List) {
+          throw const FormatException("Dữ liệu danh sách sách không hợp lệ.");
+        }
+        if (mounted) {
+          setState(() {
+            _books = decodedBooks;
+          });
+        }
+        if (syncError != null) {
+          _showSnackBar(syncError, Colors.orange);
+        }
+      } else {
+        _showSnackBar(
+          "Không thể tải danh sách sách (${response.statusCode}).",
+          Colors.red,
+        );
+      }
+    } catch (e) {
+      _showSnackBar("Lỗi tải danh sách sách: $e", Colors.red);
     } finally {
       if (mounted) {
         setState(() => _isLoading = false);

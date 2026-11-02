@@ -56,15 +56,33 @@ class _BookShelfScreenState extends State<BookShelfScreen> {
     if (!mounted) return;
     setState(() => _isLoading = true);
 
-    final url = Uri.parse('http://10.0.2.2:8000/api/shop-books');
+    String? syncError;
     try {
+      final syncUrl = Uri.parse('http://10.0.2.2:8000/api/shop-books/sync-library');
+      final syncResponse = await http.post(syncUrl);
+      if (syncResponse.statusCode != 200) {
+        syncError = "Không thể đồng bộ sách thư viện (${syncResponse.statusCode}).";
+      }
+    } catch (e) {
+      syncError = "Không thể đồng bộ sách thư viện: $e";
+    }
+
+    try {
+      final url = Uri.parse('http://10.0.2.2:8000/api/shop-books');
       final response = await http.get(url);
       if (response.statusCode == 200) {
+        final books = jsonDecode(utf8.decode(response.bodyBytes));
+        if (books is! List) {
+          throw const FormatException("Dữ liệu danh sách sách không hợp lệ.");
+        }
         if (mounted) {
           setState(() {
-            _books = jsonDecode(utf8.decode(response.bodyBytes));
+            _books = books;
             _isLoading = false;
           });
+        }
+        if (syncError != null) {
+          _showSnackBar(syncError, Colors.orangeAccent);
         }
       } else {
         if (mounted) setState(() => _isLoading = false);
@@ -72,7 +90,7 @@ class _BookShelfScreenState extends State<BookShelfScreen> {
       }
     } catch (e) {
       if (mounted) setState(() => _isLoading = false);
-      _showSnackBar("Lỗi kết nối server bán sách!", Colors.redAccent);
+      _showSnackBar("Lỗi tải danh sách sách: $e", Colors.redAccent);
     }
   }
 
